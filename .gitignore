@@ -10,3 +10,5 @@ kitepilot.session
 .DS_Store
 
 og.py
+backup
+report

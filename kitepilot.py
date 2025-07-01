@@ -5,13 +5,15 @@ KitePilot — automatically executes Telegram trade signals on Zerodha Kite.
 Educational use only.  Requires manual Kite login once per trading day.
 """
 
-import asyncio, json, logging, math, os, re, time
+import asyncio, json, logging, math, os, re, time, difflib
 from datetime import datetime
 from decimal import Decimal
 
 from dotenv import load_dotenv
 from kiteconnect import KiteConnect
 from telethon import TelegramClient, events
+import functools  # add near other imports
+#from resource.populate_symbol_map import find_symbol
 
 # ---------------------------- config & logging ----------------------------
 logging.basicConfig(
@@ -36,96 +38,120 @@ CASH_PER_TRADE     = Decimal(os.getenv("TRADE_CASH_PER_TRADE", "30000"))
 BAND_TOL_PCT       = Decimal(os.getenv("PRICE_BAND_TOLERANCE", "1"))  # ±1 %
 
 # ---------------------------- symbol map ----------------------------------
-with open("symbol_map.json", encoding="utf-8") as f:
+
+@functools.lru_cache(maxsize=1)
+def get_nse_symbols():
+    try:
+        return {row["tradingsymbol"] for row in kite.instruments("NSE")}
+    except Exception as e:
+        log.error("Could not fetch instruments list: %s", e)
+        return set()
+
+symbol_map_path = os.path.join(os.path.dirname(__file__), 'resource', 'symbol_map.json')
+with open(symbol_map_path, encoding="utf-8") as f:
     SYMBOL_MAP = json.load(f)
+
+def find_symbol(company_name, symbol_map):
+    key = company_name.strip().upper()
+
+    # 1️⃣ direct map lookup
+    if key in symbol_map:
+        log.info("Symbol map hit: '%s' -> '%s'", key, symbol_map[key])
+        return symbol_map[key]
+
+    # 2️⃣ key itself is already a tradingsymbol?
+    if key in get_nse_symbols():
+        log.info("Key '%s' is already a valid NSE trading symbol", key)
+        symbol_map[key] = key                 # store for next time
+        with open(symbol_map_path, "w", encoding="utf-8") as f:
+            json.dump(symbol_map, f, indent=2)
+        return key
+
+    # 3️⃣ fuzzy match against map keys
+    matches = difflib.get_close_matches(key, symbol_map.keys(), n=1, cutoff=0.75)
+    if matches:
+        matched = matches[0]
+        print(f"⚠️ Unknown '{key}'. Use closest match '{matched}'? [Y/n/m for manual]: ", end="")
+        user_input = input().strip().lower()
+        if user_input in ("", "y", "yes"):
+            symbol_map[key] = symbol_map[matched]
+            with open(symbol_map_path, "w", encoding="utf-8") as f:
+                json.dump(symbol_map, f, indent=2)
+            return symbol_map[matched]
+        elif user_input == "m":
+            manual = input(f"Enter trading symbol for '{key}': ").strip().upper()
+            if manual:
+                symbol_map[key] = manual
+                with open(symbol_map_path, "w", encoding="utf-8") as f:
+                    json.dump(symbol_map, f, indent=2)
+                return manual
+
+    # 4️⃣ final manual input if no fuzzy match
+    manual = input(f"⚠️ No match for '{key}'. Enter trading symbol manually (or leave blank to skip): ").strip().upper()
+    if manual:
+        symbol_map[key] = manual
+        with open(symbol_map_path, "w", encoding="utf-8") as f:
+            json.dump(symbol_map, f, indent=2)
+        return manual
+
+    return None
 
 # ---------------------------- regex parser --------------------------------
 SIGNAL_RE = re.compile(
     r"""(?i)
     (?:buy(?:ing)?|fresh\s*buying|again\s*in\s*buying\s*range|buy\s*range|buy\s*of|buy\s*at|buy\s*now|buy\s*range|new\s*members\s*can\s*buy)[^\n]*?
-    ([A-Za-z0-9 .&'’\-]+?)\s*[:\-]?\s*
-    (\d{2,5})[\-\–\—:](\d{2,5})[^\n]*?
+    ([A-Za-z0-9 .&'\-]+?)\s*[:\-]?\s*
+    (\d{2,5})[\-\\—:](\d{2,5})[^\n]*?
     (?:\n|.)*?
     (?:stop\s*loss|sl)[^\d]*(\d{2,5})
     """,
     re.IGNORECASE | re.DOTALL | re.VERBOSE
 )
 
-# # ---------------------------- Kite helpers --------------------------------
-# kite = KiteConnect(api_key=KITE_API_KEY)
-# kite.set_access_token(KITE_ACCESS_TOKEN)
-
-# def get_ltp(symbol: str) -> Decimal:
-#     data = kite.ltp([f"NSE:{symbol}"])
-#     return Decimal(str(data[f"NSE:{symbol}"]["last_price"]))
-
-# def qty_for_cash(price: Decimal) -> int:
-#     return math.floor(CASH_PER_TRADE / price)
-
-# def place_limit_buy(symbol: str, price: Decimal, qty: int) -> str:
-#     log.info("Placing BUY %s %s@%s", symbol, qty, price)
-#     return kite.place_order(
-#         variety=kite.VARIETY_REGULAR,
-#         exchange=kite.EXCHANGE_NSE,
-#         tradingsymbol=symbol,
-#         transaction_type=kite.TRANSACTION_TYPE_BUY,
-#         quantity=qty,
-#         price=float(price),
-#         order_type=kite.ORDER_TYPE_LIMIT,
-#         product=kite.PRODUCT_CNC,
-#         validity=kite.VALIDITY_DAY,
-#         tag="KitePilot"
-#     )
-
-# def wait_till_filled(order_id: str, timeout: float = 300.0) -> bool:
-#     start = time.time()
-#     while time.time() - start < timeout:
-#         for o in kite.orders():
-#             if o["order_id"] == order_id:
-#                 if o["status"] == "COMPLETE":
-#                     log.info("Order %s filled", order_id)
-#                     return True
-#                 if o["status"] in ("REJECTED", "CANCELLED"):
-#                     log.warning("Order %s %s", order_id, o["status"])
-#                     return False
-#         time.sleep(2)
-#     log.warning("Timeout waiting for order %s", order_id)
-#     return False
-
-# def convert_to_mtf(symbol: str, qty: int):
-#     try:
-#         kite.convert_position(
-#             exchange=kite.EXCHANGE_NSE,
-#             tradingsymbol=symbol,
-#             transaction_type=kite.TRANSACTION_TYPE_BUY,
-#             position_type="day",
-#             quantity=qty,
-#             old_product=kite.PRODUCT_CNC,
-#             new_product=kite.PRODUCT_MTF
-#         )
-#         log.info("Converted to MTF")
-#     except Exception as e:
-#         log.error("MTF conversion failed: %s", e)
-
-from random import uniform
+# ---------------------------- Kite helpers --------------------------------
+kite = KiteConnect(api_key=KITE_API_KEY)
+kite.set_access_token(KITE_ACCESS_TOKEN)
 
 def get_ltp(symbol: str) -> Decimal:
-    # Simulate a live price near the midpoint
-    return Decimal(str(round(uniform(100, 2000), 2)))
+    data = kite.ltp([f"NSE:{symbol}"])
+    return Decimal(str(data[f"NSE:{symbol}"]["last_price"]))
 
 def qty_for_cash(price: Decimal) -> int:
     return math.floor(CASH_PER_TRADE / price)
 
-def simulate_trade(symbol: str, ltp: Decimal, qty: int):
-    log.info("🧪 Simulated BUY %s %s@%.2f", symbol, qty, ltp)
+def place_market_buy(symbol: str, qty: int) -> str:
+    log.info("Placing MARKET BUY %s %s (MTF)", symbol, qty)
+    return kite.place_order(
+        variety=kite.VARIETY_REGULAR,
+        exchange=kite.EXCHANGE_NSE,
+        tradingsymbol=symbol,
+        transaction_type=kite.TRANSACTION_TYPE_BUY,
+        quantity=qty,
+        order_type=kite.ORDER_TYPE_MARKET,
+        product=kite.PRODUCT_MTF,
+        validity=kite.VALIDITY_DAY,
+        tag="KitePilot"
+    )
 
-
-
+def wait_till_filled(order_id: str, timeout: float = 300.0) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        for o in kite.orders():
+            if o["order_id"] == order_id:
+                if o["status"] == "COMPLETE":
+                    log.info("Order %s filled", order_id)
+                    return True
+                if o["status"] in ("REJECTED", "CANCELLED"):
+                    log.warning("Order %s %s", order_id, o["status"])
+                    return False
+        time.sleep(2)
+    log.warning("Timeout waiting for order %s", order_id)
+    return False
 
 # ---------------------------- Telegram handler ----------------------------
 client = TelegramClient("kitepilot.session", TG_API_ID, TG_API_HASH)
 
-@client.on(events.NewMessage)
+#@client.on(events.NewMessage)
 async def handle(event):
     print("event.chat_id:", event.chat_id, "TG_CHANNEL_ID:", TG_CHANNEL_ID)
     if event.chat_id != TG_CHANNEL_ID:
@@ -143,40 +169,38 @@ async def handle(event):
     lo, hi = Decimal(lo), Decimal(hi)
     
 
-    symbol = SYMBOL_MAP.get(name.strip().upper())
+    symbol = find_symbol(name, SYMBOL_MAP)
     if not symbol:
-        
         log.warning("Unknown map for '%s'", name)
         return
+    
+    log.info("📈 Signal for %s: Buy range %s %s", symbol, lo, hi)
 
-    ltp  = get_ltp(symbol)
-    mid  = (lo + hi) / 2
-    tol  = mid * BAND_TOL_PCT / 100
-    if not (mid - tol <= ltp <= mid + tol):
-        log.info("%s price %.2f out of ±%.1f%% band, skip",
-                 symbol, ltp, BAND_TOL_PCT)
+    try:
+        ltp = get_ltp(symbol)
+    except Exception as e:
+        log.error("❌ Failed to fetch LTP for %s: %s", symbol, e)
+        return
+    
+    upper_allowed = hi * (1 + BAND_TOL_PCT / Decimal(100))
+    if ltp > upper_allowed:
+        log.info(
+            "⛔ %s LTP %.2f is above high limit %.2f + %.1f%%, skipping",
+            symbol, ltp, hi, BAND_TOL_PCT
+        )
         return
 
     qty = qty_for_cash(ltp)
     if qty > 0:
-        simulate_trade(symbol, ltp, qty)
-
-    # oid = place_limit_buy(symbol, ltp, qty)
-    # if wait_till_filled(oid):
-    #     convert_to_mtf(symbol, qty)
-
-
-# #only for testing, uncomment to enable
-# @client.on(events.NewMessage)
-# async def handle(event):
-#     print("💬 Chat ID:", event.chat_id)
-#     print("📢 Channel Username:", event.chat.username)
-#     print("📄 Message:", event.raw_text)
+        oid = place_market_buy(symbol, qty)
+        if wait_till_filled(oid):
+            log.info("✅ Trade filled for %s: %s shares at %.2f", symbol, qty, ltp)
+    else:
+        log.info("⚠️ Not enough cash to buy even 1 share of %s at %.2f", symbol, ltp)
 
 async def main():
     await client.start()
     log.info("🛫 KitePilot listening to chat ID %s ...", TG_CHANNEL_ID)
-    # client.add_event_handler(handle, events.NewMessage(chats=TG_CHANNEL_ID))
     client.add_event_handler(handle,events.NewMessage(chats=TG_CHANNEL_ID)   )
     await client.run_until_disconnected()
 
