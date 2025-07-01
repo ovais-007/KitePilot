@@ -25,7 +25,8 @@ load_dotenv()                                   # read .env
 TG_API_ID          = int(os.getenv("TG_API_ID"))
 TG_API_HASH        = os.getenv("TG_API_HASH")
 TG_CHANNEL         = os.getenv("TG_CHANNEL_USERNAME")   # e.g. @mychannel
-TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID")
+#TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID")
+TG_CHANNEL_ID = int(os.getenv("TG_CHANNEL_ID"))
 
 KITE_API_KEY       = os.getenv("KITE_API_KEY")
 KITE_API_SECRET    = os.getenv("KITE_API_SECRET")
@@ -40,8 +41,14 @@ with open("symbol_map.json", encoding="utf-8") as f:
 
 # ---------------------------- regex parser --------------------------------
 SIGNAL_RE = re.compile(
-    r"(?:buy(?:ing)?|buy range|fresh buying)[^\n]*?([A-Za-z0-9 .&'-]+?)\s+(\d+)[-\u2013](\d+)[^\n]*?(?:stop loss|sl)\s*[:-]?\s*(\d+)",
-    re.IGNORECASE | re.DOTALL
+    r"""(?i)
+    (?:buy(?:ing)?|fresh\s*buying|again\s*in\s*buying\s*range|buy\s*range|buy\s*of|buy\s*at|buy\s*now|buy\s*range|new\s*members\s*can\s*buy)[^\n]*?
+    ([A-Za-z0-9 .&'’\-]+?)\s*[:\-]?\s*
+    (\d{2,5})[\-\–\—:](\d{2,5})[^\n]*?
+    (?:\n|.)*?
+    (?:stop\s*loss|sl)[^\d]*(\d{2,5})
+    """,
+    re.IGNORECASE | re.DOTALL | re.VERBOSE
 )
 
 # # ---------------------------- Kite helpers --------------------------------
@@ -118,44 +125,48 @@ def simulate_trade(symbol: str, ltp: Decimal, qty: int):
 # ---------------------------- Telegram handler ----------------------------
 client = TelegramClient("kitepilot.session", TG_API_ID, TG_API_HASH)
 
+@client.on(events.NewMessage)
 async def handle(event):
-    # if TG_CHANNEL.lstrip("@").lower() not in (event.chat.username or "").lower():
-    #     return                                                # wrong chat
-
-    if str(event.chat_id) != os.getenv("TG_CHANNEL_ID"):
+    print("event.chat_id:", event.chat_id, "TG_CHANNEL_ID:", TG_CHANNEL_ID)
+    if event.chat_id != TG_CHANNEL_ID:
+        print("Wrong chat, skipping")
         return
 
     txt = event.raw_text
     m = SIGNAL_RE.search(txt)
     if not m:
+        print("❌ Regex did not match this message:")
+        print(txt)
         return
+
     name, lo, hi, _sl = m.groups()
     lo, hi = Decimal(lo), Decimal(hi)
+    
+
     symbol = SYMBOL_MAP.get(name.strip().upper())
     if not symbol:
+        
         log.warning("Unknown map for '%s'", name)
         return
 
-    ltp = get_ltp(symbol)
-    mid = (lo + hi) / 2
-    tol = mid * BAND_TOL_PCT / 100
+    ltp  = get_ltp(symbol)
+    mid  = (lo + hi) / 2
+    tol  = mid * BAND_TOL_PCT / 100
     if not (mid - tol <= ltp <= mid + tol):
-        log.info("%s price %.2f out of ±%.1f%% band, skip", symbol, ltp, BAND_TOL_PCT)
+        log.info("%s price %.2f out of ±%.1f%% band, skip",
+                 symbol, ltp, BAND_TOL_PCT)
         return
 
     qty = qty_for_cash(ltp)
-    if qty <= 0:
-        log.info("Qty zero, skip")
-        return
+    if qty > 0:
+        simulate_trade(symbol, ltp, qty)
 
     # oid = place_limit_buy(symbol, ltp, qty)
     # if wait_till_filled(oid):
     #     convert_to_mtf(symbol, qty)
 
-    simulate_trade(symbol, ltp, qty)
 
-
-#only for testing, uncomment to enable
+# #only for testing, uncomment to enable
 # @client.on(events.NewMessage)
 # async def handle(event):
 #     print("💬 Chat ID:", event.chat_id)
@@ -164,8 +175,9 @@ async def handle(event):
 
 async def main():
     await client.start()
-    log.info("🛫 KitePilot listening to %s ...", TG_CHANNEL)
-    client.add_event_handler(handle, events.NewMessage(chats=TG_CHANNEL))
+    log.info("🛫 KitePilot listening to chat ID %s ...", TG_CHANNEL_ID)
+    # client.add_event_handler(handle, events.NewMessage(chats=TG_CHANNEL_ID))
+    client.add_event_handler(handle,events.NewMessage(chats=TG_CHANNEL_ID)   )
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
