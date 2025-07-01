@@ -25,6 +25,7 @@ load_dotenv()                                   # read .env
 TG_API_ID          = int(os.getenv("TG_API_ID"))
 TG_API_HASH        = os.getenv("TG_API_HASH")
 TG_CHANNEL         = os.getenv("TG_CHANNEL_USERNAME")   # e.g. @mychannel
+TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID")
 
 KITE_API_KEY       = os.getenv("KITE_API_KEY")
 KITE_API_SECRET    = os.getenv("KITE_API_SECRET")
@@ -39,72 +40,91 @@ with open("symbol_map.json", encoding="utf-8") as f:
 
 # ---------------------------- regex parser --------------------------------
 SIGNAL_RE = re.compile(
-    r"Buying\\s+([A-Za-z0-9 .&'-]+?)\\s+(\\d+)[-–](\\d+).*?Stop\\s+Loss\\s*[:-]\\s*(\\d+)",
+    r"(?:buy(?:ing)?|buy range|fresh buying)[^\n]*?([A-Za-z0-9 .&'-]+?)\s+(\d+)[-\u2013](\d+)[^\n]*?(?:stop loss|sl)\s*[:-]?\s*(\d+)",
     re.IGNORECASE | re.DOTALL
 )
 
-# ---------------------------- Kite helpers --------------------------------
-kite = KiteConnect(api_key=KITE_API_KEY)
-kite.set_access_token(KITE_ACCESS_TOKEN)
+# # ---------------------------- Kite helpers --------------------------------
+# kite = KiteConnect(api_key=KITE_API_KEY)
+# kite.set_access_token(KITE_ACCESS_TOKEN)
+
+# def get_ltp(symbol: str) -> Decimal:
+#     data = kite.ltp([f"NSE:{symbol}"])
+#     return Decimal(str(data[f"NSE:{symbol}"]["last_price"]))
+
+# def qty_for_cash(price: Decimal) -> int:
+#     return math.floor(CASH_PER_TRADE / price)
+
+# def place_limit_buy(symbol: str, price: Decimal, qty: int) -> str:
+#     log.info("Placing BUY %s %s@%s", symbol, qty, price)
+#     return kite.place_order(
+#         variety=kite.VARIETY_REGULAR,
+#         exchange=kite.EXCHANGE_NSE,
+#         tradingsymbol=symbol,
+#         transaction_type=kite.TRANSACTION_TYPE_BUY,
+#         quantity=qty,
+#         price=float(price),
+#         order_type=kite.ORDER_TYPE_LIMIT,
+#         product=kite.PRODUCT_CNC,
+#         validity=kite.VALIDITY_DAY,
+#         tag="KitePilot"
+#     )
+
+# def wait_till_filled(order_id: str, timeout: float = 300.0) -> bool:
+#     start = time.time()
+#     while time.time() - start < timeout:
+#         for o in kite.orders():
+#             if o["order_id"] == order_id:
+#                 if o["status"] == "COMPLETE":
+#                     log.info("Order %s filled", order_id)
+#                     return True
+#                 if o["status"] in ("REJECTED", "CANCELLED"):
+#                     log.warning("Order %s %s", order_id, o["status"])
+#                     return False
+#         time.sleep(2)
+#     log.warning("Timeout waiting for order %s", order_id)
+#     return False
+
+# def convert_to_mtf(symbol: str, qty: int):
+#     try:
+#         kite.convert_position(
+#             exchange=kite.EXCHANGE_NSE,
+#             tradingsymbol=symbol,
+#             transaction_type=kite.TRANSACTION_TYPE_BUY,
+#             position_type="day",
+#             quantity=qty,
+#             old_product=kite.PRODUCT_CNC,
+#             new_product=kite.PRODUCT_MTF
+#         )
+#         log.info("Converted to MTF")
+#     except Exception as e:
+#         log.error("MTF conversion failed: %s", e)
+
+from random import uniform
 
 def get_ltp(symbol: str) -> Decimal:
-    data = kite.ltp([f"NSE:{symbol}"])
-    return Decimal(str(data[f"NSE:{symbol}"]["last_price"]))
+    # Simulate a live price near the midpoint
+    return Decimal(str(round(uniform(100, 2000), 2)))
 
 def qty_for_cash(price: Decimal) -> int:
     return math.floor(CASH_PER_TRADE / price)
 
-def place_limit_buy(symbol: str, price: Decimal, qty: int) -> str:
-    log.info("Placing BUY %s %s@%s", symbol, qty, price)
-    return kite.place_order(
-        variety=kite.VARIETY_REGULAR,
-        exchange=kite.EXCHANGE_NSE,
-        tradingsymbol=symbol,
-        transaction_type=kite.TRANSACTION_TYPE_BUY,
-        quantity=qty,
-        price=float(price),
-        order_type=kite.ORDER_TYPE_LIMIT,
-        product=kite.PRODUCT_CNC,
-        validity=kite.VALIDITY_DAY,
-        tag="KitePilot"
-    )
+def simulate_trade(symbol: str, ltp: Decimal, qty: int):
+    log.info("🧪 Simulated BUY %s %s@%.2f", symbol, qty, ltp)
 
-def wait_till_filled(order_id: str, timeout: float = 300.0) -> bool:
-    start = time.time()
-    while time.time() - start < timeout:
-        for o in kite.orders():
-            if o["order_id"] == order_id:
-                if o["status"] == "COMPLETE":
-                    log.info("Order %s filled", order_id)
-                    return True
-                if o["status"] in ("REJECTED", "CANCELLED"):
-                    log.warning("Order %s %s", order_id, o["status"])
-                    return False
-        time.sleep(2)
-    log.warning("Timeout waiting for order %s", order_id)
-    return False
 
-def convert_to_mtf(symbol: str, qty: int):
-    try:
-        kite.convert_position(
-            exchange=kite.EXCHANGE_NSE,
-            tradingsymbol=symbol,
-            transaction_type=kite.TRANSACTION_TYPE_BUY,
-            position_type="day",
-            quantity=qty,
-            old_product=kite.PRODUCT_CNC,
-            new_product=kite.PRODUCT_MTF
-        )
-        log.info("Converted to MTF")
-    except Exception as e:
-        log.error("MTF conversion failed: %s", e)
+
 
 # ---------------------------- Telegram handler ----------------------------
 client = TelegramClient("kitepilot.session", TG_API_ID, TG_API_HASH)
 
 async def handle(event):
-    if TG_CHANNEL.lstrip("@").lower() not in (event.chat.username or "").lower():
-        return                                                # wrong chat
+    # if TG_CHANNEL.lstrip("@").lower() not in (event.chat.username or "").lower():
+    #     return                                                # wrong chat
+
+    if str(event.chat_id) != os.getenv("TG_CHANNEL_ID"):
+        return
+
     txt = event.raw_text
     m = SIGNAL_RE.search(txt)
     if not m:
@@ -128,9 +148,19 @@ async def handle(event):
         log.info("Qty zero, skip")
         return
 
-    oid = place_limit_buy(symbol, ltp, qty)
-    if wait_till_filled(oid):
-        convert_to_mtf(symbol, qty)
+    # oid = place_limit_buy(symbol, ltp, qty)
+    # if wait_till_filled(oid):
+    #     convert_to_mtf(symbol, qty)
+
+    simulate_trade(symbol, ltp, qty)
+
+
+#only for testing, uncomment to enable
+# @client.on(events.NewMessage)
+# async def handle(event):
+#     print("💬 Chat ID:", event.chat_id)
+#     print("📢 Channel Username:", event.chat.username)
+#     print("📄 Message:", event.raw_text)
 
 async def main():
     await client.start()
