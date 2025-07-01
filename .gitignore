@@ -1,1 +1,10 @@
+
+# Ignore Python env & cache
+.venv/
+
+# Ignore secrets
 .env
+kitepilot.session
+
+# Ignore macOS system files
+.DS_Store
